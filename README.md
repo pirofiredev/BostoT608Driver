@@ -27,6 +27,7 @@ to start that thing on fedora:
   - **After orientation was changed, step 5 is required**
   - 309 line in raw_pen_abs_to_pen_abs_events()
   
+  
   ```txt
      // Opposite/inverted rotation: 180°
             let x_axis = AXIS_MAX - x_axis;
