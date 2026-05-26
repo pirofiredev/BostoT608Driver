@@ -1,6 +1,6 @@
 Polished driver for Bosto T608 on KDE.
 
-If you have strange behavior, like lagging or strange behaviour, it's worth to try this one patch:
+If you have strange behavior, like lagging or touching doesn't work, it's worth to try this one patch:
 
 https://github.com/DIGImend/10moons-tools
 
