@@ -1,4 +1,5 @@
 use std::io::Error;
+use std::time::Instant;
 use std::{collections::HashMap, u16};
 
 use evdev::{
@@ -58,6 +59,7 @@ impl RawDataReader {
     fn pen_buttons(&self) -> u8 {
         self.data[Self::PEN_BUTTONS]
     }
+
 }
 
 pub struct DeviceDispatcher {
@@ -69,10 +71,15 @@ pub struct DeviceDispatcher {
     virtual_keyboard: VirtualDevice,
     was_touching: bool,
     was_in_range: bool,
+    last_pen_packet_at: Option<Instant>,
     last_x: i32,
     last_y: i32,
     last_pressure: i32,
     have_last_xy: bool,
+    // Alternates each packet to apply an imperceptible +/-1 nudge on X while
+    // the pen hovers stationary, so libinput keeps the cursor visible instead
+    // of culling a perfectly static hover position.
+    hover_jitter_toggle: bool,
 }
 
 
@@ -141,10 +148,12 @@ impl DeviceDispatcher {
             .expect("Error building virtual keyborad"),
             was_touching: false,
             was_in_range: false,
+            last_pen_packet_at: None,
             last_x: 0,
             last_y: 0,
             last_pressure: -1,
             have_last_xy: false,
+            hover_jitter_toggle: false,
         }
     }
 
@@ -266,13 +275,33 @@ impl DeviceDispatcher {
     }
 
 
+    // How long the pen is kept "in range" after the last valid packet.
+    // The tablet stops sending fresh packets (or sends pressure==0 packets)
+    // when the pen is hovering but stationary. Without this grace period the
+    // tool would drop out the instant a stale/zero packet arrives, causing
+    // KDE/libinput to hide the cursor until you move again.
+    const PROXIMITY_TIMEOUT_MS: u128 = 600;
+
     fn pen_emit_proximity(&mut self, raw_data: &RawDataReader) {
         let raw = raw_data.pressure();
 
-        // Your tablet reports >1600 while hovering, ~1600 at touch,
-        // and lower values when pressing harder. Keep tool active while
-        // the driver is receiving sane pen packets.
-        let is_in_range = raw > 0 && raw < 1900;
+        // Any nonzero pressure reading means the pen is physically present.
+        // The raw field is high while hovering (~1600 and up), lower while
+        // pressing, and 0 only when the pen is genuinely gone / no packet.
+        // We must NOT cap this at an upper bound: high hover values are valid
+        // and were previously being rejected, which dropped proximity (and
+        // hid the cursor) whenever you stopped moving while hovering.
+        // Touch never had this problem because BTN_TOUCH keeps the tool alive.
+        let has_valid_pen_data = raw > 0;
+        if has_valid_pen_data {
+            self.last_pen_packet_at = Some(Instant::now());
+        }
+
+        // Stay in range as long as we've seen a valid packet recently.
+        let is_in_range = match self.last_pen_packet_at {
+            Some(t) => t.elapsed().as_millis() < Self::PROXIMITY_TIMEOUT_MS,
+            None => false,
+        };
 
         if let Some(state) = match (self.was_in_range, is_in_range) {
             (false, true) => Some(Self::PRESSED),
@@ -310,12 +339,30 @@ impl DeviceDispatcher {
         let x_axis = AXIS_MAX - x_axis;
         let y_axis = AXIS_MAX - y_axis;
 
-        // Do NOT suppress stationary X/Y completely.
-        // KDE/libinput behaves better if the tablet keeps reporting stable position.
+        // Anti-cull jitter: when the pen hovers without touching and the
+        // position is identical to the last packet, libinput/KDE treats the
+        // tool as "stale" and hides the cursor until movement resumes. The
+        // tablet keeps streaming packets here, but a frozen coordinate isn't
+        // enough. So when we detect a stationary hover, alternate a 1-unit
+        // offset on X each packet. This is visually imperceptible but keeps
+        // libinput seeing fresh motion. We only do this while NOT touching, so
+        // drawing precision is never affected.
+        let stationary = self.have_last_xy
+            && x_axis == self.last_x
+            && y_axis == self.last_y;
+        // emit_x carries the optional jitter; x_axis stays the TRUE position
+        // so stationary detection on the next packet compares like-for-like.
+        let emit_x = if stationary && !self.was_touching {
+            self.hover_jitter_toggle = !self.hover_jitter_toggle;
+            if self.hover_jitter_toggle { x_axis + 1 } else { x_axis }
+        } else {
+            x_axis
+        };
+
         self.virtual_pen.emit(&[InputEvent::new(
             EventType::ABSOLUTE,
             AbsoluteAxisType::ABS_X.0,
-            x_axis,
+            emit_x,
         )]).expect("Error emitting ABS_X.");
 
         self.virtual_pen.emit(&[InputEvent::new(
